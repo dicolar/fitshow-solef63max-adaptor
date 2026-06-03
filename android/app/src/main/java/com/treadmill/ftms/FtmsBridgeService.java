@@ -43,8 +43,10 @@ public class FtmsBridgeService extends Service {
     private static final String TAG = "FtmsBridge";
     private static final String CHANNEL_ID = "ftms_bridge";
 
-    // Device name — must start with "TR" to pass FitShow's name filter.
-    private static final String DEVICE_NAME = "TR1200-T";
+    // BLE advertised name. FitShow/Zwift recognise the device by the FTMS service (0x1826),
+    // NOT by name prefix (confirmed: the factory "F63MAX-1218" — no "TR" prefix — is also
+    // listed by FitShow). So the name is free; use the real model name.
+    private static final String DEVICE_NAME = "SoleF63Max";
 
     // FitShow manufacturer Company ID (reverse-engineered from real TR1200 advertising packet)
     private static final int FITSHOW_COMPANY_ID = 0x0419;
