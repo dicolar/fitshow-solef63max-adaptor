@@ -295,6 +295,8 @@ public class FtmsBridgeService extends Service {
                 BluetoothGattCharacteristic characteristic, boolean preparedWrite,
                 boolean responseNeeded, int offset, byte[] value) {
 
+            beep(); // audible feedback: an FTMS/control command was received (throttled)
+
             if (UUID_CONTROL_POINT.equals(characteristic.getUuid())) {
                 handleControlPoint(value);
                 if (responseNeeded) {
@@ -336,6 +338,7 @@ public class FtmsBridgeService extends Service {
         bindToTreadmillService();
         setupBleGattServer();
         startAdvertising();
+        startFactoryClient(); // connect to factory F63MAX-1218 to relay Start/Stop
         notifyHandler.postDelayed(notifyRunnable, 1000);
     }
 
@@ -346,13 +349,166 @@ public class FtmsBridgeService extends Service {
         unregisterObserver();
         unbindService(treadmillConnection);
         stopAdvertising();
+        stopFactoryScan();
+        if (factoryGatt != null) { try { factoryGatt.close(); } catch (Exception ignored) {} factoryGatt = null; }
         if (gattServer != null) gattServer.close();
+        if (toneGen != null) { toneGen.release(); toneGen = null; }
         Log.d(TAG, "FTMS Bridge stopped");
     }
 
     @Override
     public IBinder onBind(Intent intent) {
         return null;
+    }
+
+    // =========================================================
+    // Audible beep on received FTMS commands (throttled)
+    // =========================================================
+    private android.media.ToneGenerator toneGen;
+    private volatile long lastBeepMs = 0;
+    // Min gap between beeps: FitShow streams many Set-Speed/Incline writes per second during
+    // a ramp; without throttling this would be a continuous tone. Tweak to taste.
+    private static final long BEEP_MIN_INTERVAL_MS = 250;
+    private static final int BEEP_DURATION_MS = 70;
+
+    private void beep() {
+        long now = System.currentTimeMillis();
+        if (now - lastBeepMs < BEEP_MIN_INTERVAL_MS) return;
+        lastBeepMs = now;
+        try {
+            if (toneGen == null) {
+                // STREAM_MUSIC = the treadmill's speakers; 80 = volume (0-100).
+                toneGen = new android.media.ToneGenerator(
+                        android.media.AudioManager.STREAM_MUSIC, 80);
+            }
+            toneGen.startTone(android.media.ToneGenerator.TONE_PROP_BEEP, BEEP_DURATION_MS);
+        } catch (Exception e) {
+            Log.w(TAG, "beep failed", e);
+        }
+    }
+
+    // =========================================================
+    // BLE client to the factory FTMS module (F63MAX-1218)
+    // We can't start the treadmill natively ourselves, but the factory module can:
+    // by connecting to it and writing FTMS Start/Stop we trigger its native running flow
+    // (motor enable + running app + 5s countdown + screen). So we relay FitShow's Start/Stop
+    // to it; speed/incline keep going through the Seewo AIDL once the belt is running.
+    // =========================================================
+    private static final String FACTORY_NAME = "F63MAX-1218";
+    private BluetoothLeScanner factoryScanner;
+    private BluetoothGatt factoryGatt;
+    private BluetoothGattCharacteristic factoryControlPoint;
+    private volatile boolean factoryControlReady = false;
+    private boolean factoryScanning = false;
+
+    private void startFactoryClient() {
+        try {
+            BluetoothManager bm = (BluetoothManager) getSystemService(BLUETOOTH_SERVICE);
+            BluetoothAdapter adapter = bm != null ? bm.getAdapter() : null;
+            if (adapter == null) return;
+            factoryScanner = adapter.getBluetoothLeScanner();
+            if (factoryScanner == null) { Log.e(TAG, "factory: no LE scanner"); return; }
+            android.bluetooth.le.ScanFilter filter = new android.bluetooth.le.ScanFilter.Builder()
+                    .setDeviceName(FACTORY_NAME).build();
+            android.bluetooth.le.ScanSettings settings = new android.bluetooth.le.ScanSettings.Builder()
+                    .setScanMode(android.bluetooth.le.ScanSettings.SCAN_MODE_LOW_LATENCY).build();
+            factoryScanning = true;
+            factoryScanner.startScan(java.util.Collections.singletonList(filter), settings, factoryScanCallback);
+            Log.d(TAG, "factory: scanning for " + FACTORY_NAME);
+        } catch (Exception e) { Log.e(TAG, "startFactoryClient failed", e); }
+    }
+
+    private void stopFactoryScan() {
+        if (factoryScanner != null && factoryScanning) {
+            try { factoryScanner.stopScan(factoryScanCallback); } catch (Exception ignored) {}
+            factoryScanning = false;
+        }
+    }
+
+    private final android.bluetooth.le.ScanCallback factoryScanCallback = new android.bluetooth.le.ScanCallback() {
+        @Override public void onScanResult(int callbackType, android.bluetooth.le.ScanResult result) {
+            BluetoothDevice dev = result.getDevice();
+            Log.d(TAG, "factory: found " + dev.getAddress() + ", connecting");
+            stopFactoryScan();
+            try {
+                factoryGatt = dev.connectGatt(FtmsBridgeService.this, false, factoryGattCallback,
+                        BluetoothDevice.TRANSPORT_LE);
+            } catch (Exception e) { Log.e(TAG, "factory connectGatt failed", e); }
+        }
+        @Override public void onScanFailed(int errorCode) { Log.e(TAG, "factory scan failed: " + errorCode); }
+    };
+
+    private final BluetoothGattCallback factoryGattCallback = new BluetoothGattCallback() {
+        @Override public void onConnectionStateChange(BluetoothGatt gatt, int status, int newState) {
+            if (newState == BluetoothProfile.STATE_CONNECTED) {
+                Log.d(TAG, "factory: connected, discovering services");
+                gatt.discoverServices();
+            } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
+                Log.w(TAG, "factory: disconnected");
+                factoryControlReady = false;
+                factoryControlPoint = null;
+                try { gatt.close(); } catch (Exception ignored) {}
+                if (factoryGatt == gatt) factoryGatt = null;
+                notifyHandler.postDelayed(() -> startFactoryClient(), 3000); // auto-reconnect
+            }
+        }
+        @Override public void onServicesDiscovered(BluetoothGatt gatt, int status) {
+            BluetoothGattService fms = gatt.getService(UUID_FITNESS_MACHINE_SERVICE);
+            if (fms == null) { Log.e(TAG, "factory: no FTMS service"); return; }
+            factoryControlPoint = fms.getCharacteristic(UUID_CONTROL_POINT);
+            if (factoryControlPoint == null) { Log.e(TAG, "factory: no Control Point"); return; }
+            gatt.setCharacteristicNotification(factoryControlPoint, true);
+            BluetoothGattDescriptor cccd = factoryControlPoint.getDescriptor(UUID_CCCD);
+            if (cccd != null) {
+                cccd.setValue(BluetoothGattDescriptor.ENABLE_INDICATION_VALUE);
+                gatt.writeDescriptor(cccd);
+            } else {
+                requestFactoryControl();
+            }
+        }
+        @Override public void onDescriptorWrite(BluetoothGatt gatt, BluetoothGattDescriptor descriptor, int status) {
+            requestFactoryControl(); // CCCD enabled → now request control
+        }
+        @Override public void onCharacteristicWrite(BluetoothGatt gatt, BluetoothGattCharacteristic ch, int status) {
+            Log.d(TAG, "factory: CP write status=" + status);
+        }
+        @Override public void onCharacteristicChanged(BluetoothGatt gatt, BluetoothGattCharacteristic ch) {
+            byte[] v = ch.getValue();
+            Log.d(TAG, "factory: CP indication " + bytesToHex(v));
+            // Response = 0x80 [reqOpCode] [result]; result 0x01 = success.
+            if (v != null && v.length >= 3 && (v[0] & 0xFF) == 0x80 && (v[1] & 0xFF) == 0x00
+                    && (v[2] & 0xFF) == 0x01) {
+                factoryControlReady = true;
+                Log.d(TAG, "factory: control granted — Start/Stop relay ready");
+            }
+        }
+    };
+
+    private void requestFactoryControl() {
+        writeFactoryCP(new byte[]{0x00}); // FTMS Request Control
+    }
+
+    private boolean writeFactoryCP(byte[] cmd) {
+        if (factoryGatt == null || factoryControlPoint == null) return false;
+        try {
+            factoryControlPoint.setValue(cmd);
+            factoryControlPoint.setWriteType(BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT);
+            boolean ok = factoryGatt.writeCharacteristic(factoryControlPoint);
+            Log.d(TAG, "factory: CP write " + bytesToHex(cmd) + " queued=" + ok);
+            return ok;
+        } catch (Exception e) { Log.e(TAG, "writeFactoryCP failed", e); return false; }
+    }
+
+    /** Relay FitShow's Start to the factory module → native start + running app. */
+    private boolean relayStartToFactory() {
+        if (!factoryControlReady) { Log.w(TAG, "relayStart: factory not ready"); return false; }
+        return writeFactoryCP(new byte[]{0x07}); // Start/Resume
+    }
+
+    /** Relay Stop to the factory module → native stop. */
+    private boolean relayStopToFactory() {
+        if (!factoryControlReady) { Log.w(TAG, "relayStop: factory not ready"); return false; }
+        return writeFactoryCP(new byte[]{0x08, 0x01}); // Stop
     }
 
     // =========================================================
@@ -429,21 +585,24 @@ public class FtmsBridgeService extends Service {
                     // follow will apply normally.
                     Log.d(TAG, "Start received, already RUNNING — no-op (will accept speed/slope)");
                 } else {
-                    // STOPPED: a low-level start (transact 1) only half-starts — the belt creeps
-                    // at speedStart but the controller stays in a state where setSpeed doesn't
-                    // drive the motor. The real start requires trunning's full flow (motor_en
-                    // GPIO + running mode), which only its QuickStartActivity performs, and we
-                    // can't launch it (non-exported; would need the vendor platform key we don't
-                    // have). So: do NOT software-start. The user starts via the panel's
-                    // "快速启动", then FitShow controls speed/incline fully.
-                    Log.d(TAG, "Start while STOPPED — please start on the treadmill panel (快速启动); not software-starting");
+                    // STOPPED: relay Start to the factory F63MAX-1218 module, which performs the
+                    // native start (motor enable GPIO + running app + 5s countdown). Once it's
+                    // running, FitShow's speed/incline commands take effect via the Seewo AIDL.
+                    // (We can't do the native start ourselves — non-exported QuickStartActivity.)
+                    if (relayStartToFactory()) {
+                        Log.d(TAG, "Start while STOPPED — relayed to factory module");
+                    } else {
+                        Log.d(TAG, "Start while STOPPED — factory not ready; start on the panel (快速启动)");
+                    }
                 }
                 break;
             case 0x08: // Stop or Pause
                 if (value.length >= 2 && value[1] == 0x02) {
                     treadmillPause();
                 } else {
-                    treadmillStop();
+                    // Prefer the factory module's native stop (exits the running app cleanly);
+                    // fall back to the AIDL stop if the factory link isn't ready.
+                    if (!relayStopToFactory()) treadmillStop();
                 }
                 break;
             case 0x03: // Set Target Inclination (0.1% units, little-endian)
@@ -777,11 +936,11 @@ public class FtmsBridgeService extends Service {
         // Mirror the real TR1200 FS-BT-D2 module so FitShow recognises a genuine module.
         BluetoothGattService disService = new BluetoothGattService(
                 UUID_DIS, BluetoothGattService.SERVICE_TYPE_PRIMARY);
-        disService.addCharacteristic(makeReadString(UUID_MANUFACTURER_NAME, "FITSHOW"));
-        disService.addCharacteristic(makeReadString(UUID_MODEL_NUMBER,      "FS-BT-D2"));
-        disService.addCharacteristic(makeReadString(UUID_SERIAL_NUMBER,     "FS231221001"));
-        disService.addCharacteristic(makeReadString(UUID_HARDWARE_REVISION, "1.0"));
-        disService.addCharacteristic(makeReadString(UUID_SOFTWARE_REVISION, "1.3.3"));
+        disService.addCharacteristic(makeReadString(UUID_MANUFACTURER_NAME, "Anplus"));
+        disService.addCharacteristic(makeReadString(UUID_MODEL_NUMBER,      "F63MAX"));
+        disService.addCharacteristic(makeReadString(UUID_SERIAL_NUMBER,     "1218"));
+        disService.addCharacteristic(makeReadString(UUID_HARDWARE_REVISION, "1.0.1"));
+        disService.addCharacteristic(makeReadString(UUID_SOFTWARE_REVISION, "1.7.1"));
 
         // Register the three services sequentially (see pendingServices comment).
         pendingServices.add(fmsService);
@@ -863,6 +1022,8 @@ public class FtmsBridgeService extends Service {
         AdvertiseData advData = new AdvertiseData.Builder()
                 .setIncludeDeviceName(false)
                 .setIncludeTxPowerLevel(false)
+                // REQUIRED for iOS FitShow — without this manufacturer data (Company ID 0x0419)
+                // the iOS app shows an empty list. Android FitShow lists fine without it.
                 .addManufacturerData(FITSHOW_COMPANY_ID, mfData)
                 .addServiceUuid(fff0Uuid)
                 .addServiceUuid(ftmsUuid)
