@@ -17,3 +17,4 @@ Thumbs.db
 # Decompiled third-party APKs / sources (not redistributable)
 decompile/
 *.apk.idsig
+/release

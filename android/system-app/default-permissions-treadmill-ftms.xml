@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Place in /system/etc/default-permissions/ so the bridge's runtime BLE
+     permissions are auto-granted on first scan (no manual pm grant needed). -->
+<exceptions>
+    <exception package="com.treadmill.ftms">
+        <permission name="android.permission.BLUETOOTH_CONNECT" fixed="false"/>
+        <permission name="android.permission.BLUETOOTH_ADVERTISE" fixed="false"/>
+        <permission name="android.permission.BLUETOOTH_SCAN" fixed="false"/>
+    </exception>
+</exceptions>
