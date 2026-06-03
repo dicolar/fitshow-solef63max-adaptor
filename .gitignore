@@ -1,0 +1,19 @@
+# Android / Gradle build artifacts
+**/build/
+.gradle/
+local.properties
+*.iml
+.idea/
+captures/
+
+# Keystores / signing
+*.jks
+*.keystore
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Decompiled third-party APKs / sources (not redistributable)
+decompile/
+*.apk.idsig

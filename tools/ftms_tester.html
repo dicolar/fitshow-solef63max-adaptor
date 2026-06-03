@@ -1,0 +1,265 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>跑步机控制</title>
+<style>
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system, sans-serif; max-width: 460px; margin: 0 auto; padding: 14px; background: #f0f0f0; color: #111; }
+  .card { background: #fff; border-radius: 14px; padding: 16px; margin-bottom: 12px; box-shadow: 0 1px 4px rgba(0,0,0,0.1); }
+  .label { font-size: 12px; color: #999; margin-bottom: 2px; text-transform: uppercase; letter-spacing: .4px; }
+  .big { font-size: 40px; font-weight: 700; line-height: 1; }
+  .unit { font-size: 13px; color: #aaa; margin-top: 2px; }
+  .badge { font-size: 12px; padding: 3px 10px; border-radius: 20px; font-weight: 600; }
+  .b-ok   { background: #d1fae5; color: #065f46; }
+  .b-run  { background: #dbeafe; color: #1e3a8a; }
+  .b-pause{ background: #fef3c7; color: #78350f; }
+  .b-err  { background: #fee2e2; color: #991b1b; }
+  .b-gray { background: #e5e7eb; color: #6b7280; }
+  .row { display: flex; gap: 8px; align-items: center; }
+  button { padding: 9px 18px; border-radius: 10px; border: 1.5px solid #e0e0e0; background: #fff; cursor: pointer; font-size: 14px; font-weight: 500; transition: all .12s; }
+  button:active:not(:disabled) { transform: scale(.96); background: #f5f5f5; }
+  button:disabled { opacity: .3; cursor: default; }
+  .adj { width: 44px; height: 44px; font-size: 22px; border-radius: 50%; padding: 0; }
+  .val-box { font-size: 20px; font-weight: 700; min-width: 64px; text-align: center; }
+  .send-btn { border-color: #3b82f6; color: #1d4ed8; }
+  input[type=range] { width: 100%; margin-top: 8px; accent-color: #3b82f6; }
+  .stat-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-bottom: 14px; }
+  .stat { background: #f8f9fa; border-radius: 10px; padding: 10px 12px; }
+  hr { border: none; border-top: 1px solid #f0f0f0; margin: 12px 0; }
+  .sec-title { font-size: 11px; font-weight: 700; color: #aaa; text-transform: uppercase; letter-spacing: .5px; margin-bottom: 10px; }
+  .ctrl-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+  .btn-start  { border-color: #22c55e; color: #15803d; }
+  .btn-pause  { border-color: #f59e0b; color: #b45309; }
+  .btn-resume { border-color: #3b82f6; color: #1d4ed8; }
+  .btn-stop   { border-color: #ef4444; color: #b91c1c; }
+  .log { font-family: monospace; font-size: 11px; color: #666; background: #f8f8f8; border-radius: 8px; padding: 8px 10px; max-height: 120px; overflow-y: auto; white-space: pre-wrap; word-break: break-all; }
+  .state-bar { font-size: 13px; color: #555; margin-top: 6px; }
+</style>
+</head>
+<body>
+
+<div class="card">
+  <div class="row" style="margin-bottom:10px;justify-content:space-between;">
+    <strong style="font-size:16px;">跑步机控制台</strong>
+    <span id="status-badge" class="badge b-gray">未连接</span>
+  </div>
+  <div class="row">
+    <button id="btn-scan" onclick="doScan()">🔵 连接设备</button>
+    <button id="btn-disconnect" onclick="doDisconnect()" disabled>断开</button>
+  </div>
+  <div class="state-bar" id="state-bar"></div>
+</div>
+
+<div id="main" style="display:none">
+
+  <!-- 实时数据 -->
+  <div class="card">
+    <div class="stat-grid">
+      <div class="stat"><div class="label">速度</div><div class="big" id="v-speed">—</div><div class="unit">km/h</div></div>
+      <div class="stat"><div class="label">坡度</div><div class="big" id="v-incline">—</div><div class="unit">%</div></div>
+      <div class="stat"><div class="label">状态</div><div class="big" id="v-state" style="font-size:22px;">—</div></div>
+    </div>
+
+    <!-- 运动控制 -->
+    <div class="sec-title">运动控制</div>
+    <div class="ctrl-grid">
+      <button id="btn-start"  class="btn-start"  onclick="doStart()"  disabled>▶ 启动</button>
+      <button id="btn-pause"  class="btn-pause"  onclick="doPause()"  disabled>⏸ 暂停</button>
+      <button id="btn-resume" class="btn-resume" onclick="doResume()" disabled>↺ 恢复</button>
+      <button id="btn-stop"   class="btn-stop"   onclick="doStop()"   disabled colspan="3" style="grid-column:span 3">⏹ 停止</button>
+    </div>
+  </div>
+
+  <!-- 速度 -->
+  <div class="card">
+    <div class="sec-title">速度调节</div>
+    <div class="row">
+      <button class="adj" onclick="adjSpeed(-0.5)">−</button>
+      <span class="val-box" id="t-speed">5.0</span>
+      <span class="unit">km/h</span>
+      <button class="adj" onclick="adjSpeed(0.5)">+</button>
+      <button class="send-btn" onclick="sendSpeed()" id="btn-send-speed" disabled>设置</button>
+    </div>
+    <input type="range" min="0.5" max="20" step="0.5" value="5" id="sl-speed" oninput="slSpeed(this.value)">
+  </div>
+
+  <!-- 坡度 -->
+  <div class="card">
+    <div class="sec-title">坡度调节</div>
+    <div class="row">
+      <button class="adj" onclick="adjIncline(-1)">−</button>
+      <span class="val-box" id="t-incline">0</span>
+      <span class="unit">%</span>
+      <button class="adj" onclick="adjIncline(1)">+</button>
+      <button class="send-btn" onclick="sendIncline()" id="btn-send-incline" disabled>设置</button>
+    </div>
+    <input type="range" min="0" max="15" step="1" value="0" id="sl-incline" oninput="slIncline(this.value)">
+  </div>
+
+</div>
+
+<div class="card">
+  <div class="label" style="margin-bottom:5px;">日志</div>
+  <div class="log" id="log">等待连接...</div>
+</div>
+
+<script>
+const FTMS_SVC  = '00001826-0000-1000-8000-00805f9b34fb';
+const TREADMILL = '00002acd-0000-1000-8000-00805f9b34fb';
+const FEATURE   = '00002acc-0000-1000-8000-00805f9b34fb';
+const CTRL_PT   = '00002ad9-0000-1000-8000-00805f9b34fb';
+
+let device, server, treadChar, ctrlChar;
+let tSpeed = 5.0, tIncline = 0;
+// state: 'stopped' | 'running' | 'paused'
+let state = 'stopped';
+
+function log(msg) {
+  const el = document.getElementById('log');
+  el.textContent = new Date().toLocaleTimeString() + '  ' + msg + '\n' + el.textContent;
+}
+
+function setState(s) {
+  state = s;
+  const labels = { stopped:'已停止', running:'运行中', paused:'已暂停' };
+  const icons  = { stopped:'⏹', running:'▶', paused:'⏸' };
+  document.getElementById('v-state').textContent = icons[s] || '?';
+
+  const bs = document.getElementById('status-badge');
+  const classes = { stopped:'b-ok', running:'b-run', paused:'b-pause' };
+  bs.textContent = labels[s] || s;
+  bs.className = 'badge ' + (classes[s] || 'b-gray');
+
+  document.getElementById('btn-start') .disabled = (s !== 'stopped');
+  document.getElementById('btn-pause') .disabled = (s !== 'running');
+  document.getElementById('btn-resume').disabled = (s !== 'paused');
+  document.getElementById('btn-stop')  .disabled = (s === 'stopped');
+  document.getElementById('btn-send-speed')  .disabled = (s === 'stopped');
+  document.getElementById('btn-send-incline').disabled = (s === 'stopped');
+
+  document.getElementById('state-bar').textContent = labels[s] ? '状态：' + labels[s] : '';
+}
+
+async function doScan() {
+  if (!navigator.bluetooth) { alert('请用桌面版 Chrome'); return; }
+  try {
+    log('扫描中...');
+    device = await navigator.bluetooth.requestDevice({
+      filters: [{ services: [FTMS_SVC] }],
+      optionalServices: [FTMS_SVC]
+    });
+    log('找到：' + device.name);
+    device.addEventListener('gattserverdisconnected', onDisconnect);
+    server = await device.gatt.connect();
+    const svc = await server.getPrimaryService(FTMS_SVC);
+    log('FTMS 服务已连接 ✓');
+
+    try {
+      treadChar = await svc.getCharacteristic(TREADMILL);
+      await treadChar.startNotifications();
+      treadChar.addEventListener('characteristicvaluechanged', onData);
+      log('数据通知启用 ✓');
+    } catch(e) { log('数据通道失败: ' + e.message); }
+
+    try {
+      ctrlChar = await svc.getCharacteristic(CTRL_PT);
+      log('控制点就绪 ✓');
+    } catch(e) { log('控制点失败: ' + e.message); }
+
+    document.getElementById('main').style.display = '';
+    document.getElementById('btn-disconnect').disabled = false;
+    setState('stopped');
+  } catch(e) {
+    log('错误: ' + e.message);
+    document.getElementById('status-badge').textContent = '连接失败';
+    document.getElementById('status-badge').className = 'badge b-err';
+  }
+}
+
+function onDisconnect() {
+  log('已断开');
+  document.getElementById('status-badge').textContent = '已断开';
+  document.getElementById('status-badge').className = 'badge b-err';
+  document.getElementById('main').style.display = 'none';
+  document.getElementById('btn-disconnect').disabled = true;
+}
+
+function doDisconnect() { if (device?.gatt.connected) device.gatt.disconnect(); }
+
+function onData(e) {
+  const v = new DataView(e.target.value.buffer);
+  if (v.byteLength < 4) return;
+  const flags = v.getUint16(0, true);
+  const spd = v.getUint16(2, true) / 100;
+  document.getElementById('v-speed').textContent = spd.toFixed(1);
+
+  // Auto-detect state from speed (treadmill ground truth)
+  if (spd > 0.05 && state !== 'running') setState('running');
+  else if (spd <= 0.05 && state === 'running') setState('stopped');
+
+  if ((flags & 0x04) && v.byteLength >= 8) {
+    const inc = v.getInt16(6, true) / 10;
+    document.getElementById('v-incline').textContent = inc.toFixed(1);
+  }
+}
+
+async function send(bytes) {
+  if (!ctrlChar) { log('未连接'); return false; }
+  try { await ctrlChar.writeValue(new Uint8Array(bytes)); return true; }
+  catch(e) { log('发送失败: ' + e.message); return false; }
+}
+
+async function doStart() {
+  log('启动 → opCode 0x07');
+  if (await send([0x07])) setState('running');
+}
+async function doPause() {
+  log('暂停 → opCode 0x08 0x02');
+  if (await send([0x08, 0x02])) setState('paused');
+}
+async function doResume() {
+  log('恢复 → opCode 0x07');
+  if (await send([0x07])) setState('running');
+}
+async function doStop() {
+  log('停止 → opCode 0x08 0x01');
+  if (await send([0x08, 0x01])) setState('stopped');
+}
+
+// Speed
+function adjSpeed(d) {
+  tSpeed = Math.round((tSpeed + d) * 10) / 10;
+  tSpeed = Math.max(0.5, Math.min(20, tSpeed));
+  document.getElementById('t-speed').textContent = tSpeed.toFixed(1);
+  document.getElementById('sl-speed').value = tSpeed;
+}
+function slSpeed(v) {
+  tSpeed = parseFloat(v);
+  document.getElementById('t-speed').textContent = tSpeed.toFixed(1);
+}
+async function sendSpeed() {
+  const raw = Math.round(tSpeed * 100);
+  if (await send([0x02, raw & 0xFF, (raw >> 8) & 0xFF]))
+    log('速度 → ' + tSpeed.toFixed(1) + ' km/h');
+}
+
+// Incline
+function adjIncline(d) {
+  tIncline = Math.max(0, Math.min(15, tIncline + d));
+  document.getElementById('t-incline').textContent = tIncline;
+  document.getElementById('sl-incline').value = tIncline;
+}
+function slIncline(v) {
+  tIncline = parseInt(v);
+  document.getElementById('t-incline').textContent = tIncline;
+}
+async function sendIncline() {
+  const raw = tIncline * 10;
+  if (await send([0x03, raw & 0xFF, (raw >> 8) & 0xFF]))
+    log('坡度 → ' + tIncline + '%');
+}
+</script>
+</body>
+</html>
