@@ -201,11 +201,17 @@ FFF0 私有服务（FS-BT 协议）：
 | 23 | m() | b() | 停止校准 |
 | 24 | c(int) | — | 恒返回 false（空实现）|
 
-**软启动已实现**：FitShow 在停止态发 Start → 延迟 3 秒（对齐 FitShow 的 3-2-1 倒数）→ transact(1) 启动皮带。⚠️ 远程启动皮带，绕过物理启动键，使用注意安全（启动前先站到脚踏板上）。
+**软启动结论（已放弃远程软启动）：**
+- 低层 `transact(1)`（controller.l()）只能"半启动"：皮带按 speedStart 蠕动，但控制器停在一个 setSpeed 返回成功(result=0)却不驱动电机的状态。实测确认。
+- 真正的启动由 trunning 的 `QuickStartActivity` 完成，它做了两件我们做不到的事：① 写 `motor_en` GPIO（`/sys/devices/platform/cvte_gpio/motor_en`="1"，见 `TRunning.e()`）；② 走完整运行态。**实测：拉起 QuickStartActivity 后，大屏进运行界面 + FitShow 速度/坡度完全双向驱动电机。**
+- 但我们的 App **无法**自己拉起它：`QuickStartActivity` 未 `exported`，需 `START_ANY_ACTIVITY`（signature 级），而该 ROM 平台证书是**厂商私有平台密钥**（指纹 `efa27443…`，≠ 公开 AOSP 平台密钥 `c8a2e9bc…`，私钥不可得）→ 无法平台签名。
 
-**两个已知限制：**
-1. **大屏不进运行界面**：transact(1) 只驱动硬件,trunning 面板 UI 不跳转。要连界面带原生倒计时需拉起 trunning 的 `QuickStartActivity`,但它未声明 `exported`(仅 MONKEY filter)→ 普通 App 拉不起,**需先把桥接做成系统 App** 才能用。
-2. **App 调速与面板按钮不同步**：trunning 的 setSpeed 走 `e.a(this.k)`,`this.k`(mTargetSpeed)是其进程内**私有缓存**,只被面板按钮更新、不跟随 BLE;唯一外部广播 `to_thardwareservice` 仅 pause/resume。**无外部接口可改其缓存,广播同步无解。** 仅在"App 调速后又碰面板"混用时出现;纯 App 控制不受影响。
+**支持的使用流程（完整可用）：**
+> 在跑步机屏幕上点「快速启动」让皮带跑起来 → 用 FitShow 连 `TR1200-T` → 速度/坡度双向联动、大屏同步。
+
+**已知限制：**
+1. **不能从 FitShow 远程"软启动"皮带**：必须先在面板点快速启动（原因见上，需厂商平台密钥或 root 助手才能自动化，均不划算/不稳）。
+2. **App 调速与面板物理按钮不同步**：trunning 的 setSpeed 走 `e.a(this.k)`，`this.k`(mTargetSpeed) 是其进程内私有缓存，不跟随 BLE；唯一外部广播 `to_thardwareservice` 仅 pause/resume，改不了它的缓存。仅在"App 调速后又去碰面板按钮"混用时出现；纯 App 控制不受影响。
 
 ---
 
@@ -252,6 +258,32 @@ adb shell logcat -s FtmsBridge:D
 5. 网页工具：支持从停止状态启动
 
 ---
+
+### 10. 重要发现：跑步机自带「出厂原生 FTMS」F63MAX-1218（2026-06-03）
+
+FitShow 扫描时除了我们的 `TR1200-T`，还出现了 **`F63MAX-1218`**（MAC `F6:C0:08:01:7F:A9`，
+与本机 Android 蓝牙不同的独立射频）。经 `dumpsys bluetooth_manager` 确认：Android 蓝牙栈里
+**只有** 我们的 `com.treadmill.ftms`（TR1200-T）；F63MAX-1218 不在其中，`/dev/ttyS1` 是
+Android 蓝牙 HAL 本身。结论：**F63MAX-1218 是跑步机出厂自带的原生 FTMS 蓝牙，跑在独立芯片
+（多半在下控板）上，独立于希沃 Android 主机。**
+
+两个连接的能力对比（实测）：
+
+| 能力 | F63MAX-1218（出厂原生） | TR1200-T（本项目桥接） |
+|---|---|---|
+| 启动 / 进运行App / 5s 倒数 | ✅ 固件原生 | ❌（需面板手动「快速启动」） |
+| 停止 / 退出 | ✅ | ❌ |
+| 坡度控制 | ✅（多次快点会排队逐步执行） | ✅ 双向 |
+| 速度控制 | ❌ 只读 | ✅ 双向 |
+| 大屏同步 | ✅ | 部分 |
+
+**为何原生模块不能远程调速**：nRF 读其 `Supported Speed Range(0x2AD4)` = **Min 0.0 / Max 0.0
+km/h** —— 出厂固件把可设速度范围声明为 0–0，等于"速度不可设"，故所有 App 都只读速度。
+坡度范围 0–15 有效，故坡度可调。该模块为独立闭源固件，**无法修改**。
+
+**结论（两条路各缺一块且都改不动，按场景二选一）：**
+- 需要 App 自动控速（Zwift 等）→ 用 **TR1200-T（本项目）**：速度+坡度全双向，这是它不可替代的价值；代价是需面板手动起步、大屏不进运行 App（无法拉起 `QuickStartActivity`，缺厂商平台密钥）。
+- 只要原生界面 + 控坡度 + 记录、速度手动调 → 用 **F63MAX-1218（出厂）**，开箱即用。
 
 ## 关键文件路径（跑步机上）
 

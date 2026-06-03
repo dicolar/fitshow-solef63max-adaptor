@@ -427,12 +427,14 @@ public class FtmsBridgeService extends Service {
                     // follow will apply normally.
                     Log.d(TAG, "Start received, already RUNNING — no-op (will accept speed/slope)");
                 } else {
-                    // STOPPED: FitShow shows a 3-2-1 countdown after Start and expects the belt
-                    // to wait for it. Delay the real start ~3s so the belt doesn't move during
-                    // the countdown. (Cancelled if a Stop arrives first.)
-                    Log.d(TAG, "Start while STOPPED — scheduling real start in 3s (match FitShow countdown)");
-                    notifyHandler.removeCallbacks(delayedStartRunnable);
-                    notifyHandler.postDelayed(delayedStartRunnable, 3000);
+                    // STOPPED: a low-level start (transact 1) only half-starts — the belt creeps
+                    // at speedStart but the controller stays in a state where setSpeed doesn't
+                    // drive the motor. The real start requires trunning's full flow (motor_en
+                    // GPIO + running mode), which only its QuickStartActivity performs, and we
+                    // can't launch it (non-exported; would need the vendor platform key we don't
+                    // have). So: do NOT software-start. The user starts via the panel's
+                    // "快速启动", then FitShow controls speed/incline fully.
+                    Log.d(TAG, "Start while STOPPED — please start on the treadmill panel (快速启动); not software-starting");
                 }
                 break;
             case 0x08: // Stop or Pause
