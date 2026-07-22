@@ -48,6 +48,14 @@ public class FtmsBridgeService extends Service {
     // listed by FitShow). So the name is free; use the real model name.
     private static final String DEVICE_NAME = "SoleF63Max";
 
+    // Force FitShow onto the FFF0 private protocol by hiding standard FTMS: when true we neither
+    // advertise 0x1826 nor add the FTMS GATT service. This is what makes heart rate work — FitShow
+    // only forwards the user's HR (e.g. Apple Watch) over the private SYS_STATUS path; given a
+    // standard FTMS service it uses that instead and drops to a stripped UI with no HR.
+    // Trade-off: while this is true, standard-FTMS clients (Zwift) and FTMS-based control are off.
+    // Set false to expose FTMS again (Zwift speed/incline) at the cost of FitShow heart rate.
+    private static final boolean FITSHOW_PRIVATE_ONLY = true;
+
     // FitShow manufacturer Company ID (reverse-engineered from real TR1200 advertising packet)
     private static final int FITSHOW_COMPANY_ID = 0x0419;
 
@@ -67,6 +75,10 @@ public class FtmsBridgeService extends Service {
     private static final UUID UUID_SUPPORTED_POWER_RANGE       = UUID.fromString("00002ad8-0000-1000-8000-00805f9b34fb");
     private static final UUID UUID_SUPPORTED_HR_RANGE          = UUID.fromString("00002ad7-0000-1000-8000-00805f9b34fb");
     private static final UUID UUID_TRAINING_STATUS             = UUID.fromString("00002ad3-0000-1000-8000-00805f9b34fb");
+    // Standard Heart Rate Service — lets an app use the treadmill's own handgrip/strap reading.
+    private static final UUID UUID_HEART_RATE_SERVICE     = UUID.fromString("0000180d-0000-1000-8000-00805f9b34fb");
+    private static final UUID UUID_HEART_RATE_MEASUREMENT = UUID.fromString("00002a37-0000-1000-8000-00805f9b34fb");
+    private static final UUID UUID_BODY_SENSOR_LOCATION   = UUID.fromString("00002a38-0000-1000-8000-00805f9b34fb");
 
     // FitShow private service UUID — must appear in advertising alongside 0x1826
     private static final UUID UUID_FFF0                     = UUID.fromString("0000fff0-0000-1000-8000-00805f9b34fb");
@@ -132,8 +144,15 @@ public class FtmsBridgeService extends Service {
     private static final int TXN_SET_SLOPE    = 5;   // a(int i) → setSlope
     private static final int TXN_ADD_OBSERVER    = 10;  // a(IRunningObserver) → addListener
     private static final int TXN_REMOVE_OBSERVER = 11;  // b(IRunningObserver) → removeListener
+    // Heart-rate observer lives on the same ITreadmillService:
+    //   case 19 → a(IHeartbeatObserver), case 20 → b(IHeartbeatObserver)
+    // NOTE: the service only *emits* HR (handgrip / chest strap). There is no setter, so an
+    // app-supplied HR can be relayed to FitShow but cannot be pushed onto the treadmill's own UI.
+    private static final int TXN_ADD_HR_OBSERVER    = 19;
+    private static final int TXN_REMOVE_HR_OBSERVER = 20;
     private static final String ITREADMILL_DESCRIPTOR = "com.seewo.libthardware.ITreadmillService";
     private static final String IOBSERVER_DESCRIPTOR  = "com.seewo.libthardware.module.treadmill.IRunningObserver";
+    private static final String IHEARTBEAT_DESCRIPTOR = "com.seewo.libthardware.module.physicalsign.IHeartbeatObserver";
 
     // State
     private IBinder treadmillServiceBinder;
@@ -143,6 +162,7 @@ public class FtmsBridgeService extends Service {
     private BluetoothGattCharacteristic treadmillDataChar;
     private BluetoothGattCharacteristic statusChar;
     private BluetoothGattCharacteristic fff1Char;
+    private BluetoothGattCharacteristic hrMeasurementChar;
 
     // GATT services must be added one at a time, waiting for onServiceAdded between
     // each — adding them back-to-back is unreliable on this RK3 BLE stack.
@@ -151,6 +171,25 @@ public class FtmsBridgeService extends Service {
     private volatile double currentSpeedKmh = 0.0;
     private volatile int currentSlope = 0;
     private volatile boolean treadmillRunning = false;
+
+    // While the factory module runs its native 5s start countdown the belt speed is still 0,
+    // so tmState is not yet RUNNING. During this window we report STATUS_START to FitShow so it
+    // waits for the countdown instead of concluding the machine never started.
+    private volatile long startingUntilMs = 0;
+    private static final long START_COUNTDOWN_MS = 8000;
+
+    // ---- Heart rate ----
+    // Two possible sources; both go stale so we stop reporting a frozen value:
+    //   appHeartRate     — pushed down by the app in the FitShow SYS_STATUS request
+    //                      (that is where FitShow forwards the user's chosen HR source,
+    //                       e.g. an Apple Watch). Spec: SYS_STATUS | 心率(B) | 备用(N).
+    //   machineHeartRate — the treadmill's own handgrip / chest-strap reading, via
+    //                      IHeartbeatObserver.
+    private volatile int appHeartRate = 0;
+    private volatile long appHeartRateMs = 0;
+    private volatile int machineHeartRate = 0;
+    private volatile long machineHeartRateMs = 0;
+    private static final long HR_VALID_MS = 10_000;
 
     // Internal state: stopped / running / paused
     // Used to decide whether 0x07 should call start or resume.
@@ -164,13 +203,6 @@ public class FtmsBridgeService extends Service {
             tickWorkout();
             notifyTreadmillData();
             notifyHandler.postDelayed(this, 1000);
-        }
-    };
-
-    // Delayed real-start, so the belt waits out FitShow's 3-2-1 countdown.
-    private final Runnable delayedStartRunnable = new Runnable() {
-        @Override public void run() {
-            if (tmState != TmState.RUNNING) treadmillStart();
         }
     };
 
@@ -219,6 +251,7 @@ public class FtmsBridgeService extends Service {
                     tmState = TmState.STOPPED;
                     treadmillRunning = false;
                     currentSpeedKmh = 0;
+                    startingUntilMs = 0;
                     Log.d(TAG, "Treadmill stopped");
                     notifyMachineStatus((byte) 0x02);
                     notifyTreadmillData();
@@ -235,6 +268,57 @@ public class FtmsBridgeService extends Service {
     };
 
     // =========================================================
+    // IHeartbeatObserver — the treadmill's own HR source
+    // (handgrip sensors / paired chest strap). Single callback:
+    //   code 1 → a(int bpm)
+    // =========================================================
+    private final Binder heartbeatObserverBinder = new Binder() {
+        @Override
+        protected boolean onTransact(int code, Parcel data, Parcel reply, int flags) throws RemoteException {
+            if (code == 1) { // onHeartRate(int bpm)
+                data.enforceInterface(IHEARTBEAT_DESCRIPTOR);
+                int bpm = data.readInt();
+                if (bpm > 0 && bpm < 250) {
+                    machineHeartRate = bpm;
+                    machineHeartRateMs = System.currentTimeMillis();
+                    Log.d(TAG, "Machine HR: " + bpm);
+                    notifyTreadmillData();
+                    notifyHeartRate();
+                }
+                return true;
+            }
+            return super.onTransact(code, data, reply, flags);
+        }
+
+        @Override
+        public String getInterfaceDescriptor() {
+            return IHEARTBEAT_DESCRIPTOR;
+        }
+    };
+
+    /**
+     * Heart rate to report, or 0 if unknown.
+     * The app-supplied value wins — it is the source the user picked in the app (watch/strap);
+     * the treadmill's own handgrip reading is the fallback. Both expire so a stale reading is
+     * not reported forever.
+     */
+    private int currentHeartRate() {
+        long now = System.currentTimeMillis();
+        if (appHeartRate > 0 && now - appHeartRateMs < HR_VALID_MS) return appHeartRate;
+        if (machineHeartRate > 0 && now - machineHeartRateMs < HR_VALID_MS) return machineHeartRate;
+        return 0;
+    }
+
+    /** Standard Heart Rate Measurement (0x2A37): flags byte (bit0=0 → uint8 bpm) + bpm. */
+    private void notifyHeartRate() {
+        if (gattServer == null || hrMeasurementChar == null || connectedDevice == null) return;
+        int hr = currentHeartRate();
+        if (hr <= 0) return;
+        hrMeasurementChar.setValue(new byte[]{0x00, (byte) (hr & 0xFF)});
+        gattServer.notifyCharacteristicChanged(connectedDevice, hrMeasurementChar, false);
+    }
+
+    // =========================================================
     // Service connection to thardwareservice
     // =========================================================
     private final ServiceConnection treadmillConnection = new ServiceConnection() {
@@ -243,6 +327,7 @@ public class FtmsBridgeService extends Service {
             Log.d(TAG, "Connected to thardwareservice");
             treadmillServiceBinder = service;
             registerObserver();
+            registerHeartbeatObserver();
         }
 
         @Override
@@ -295,9 +380,8 @@ public class FtmsBridgeService extends Service {
                 BluetoothGattCharacteristic characteristic, boolean preparedWrite,
                 boolean responseNeeded, int offset, byte[] value) {
 
-            beep(); // audible feedback: an FTMS/control command was received (throttled)
-
             if (UUID_CONTROL_POINT.equals(characteristic.getUuid())) {
+                beep(); // real FTMS control command
                 handleControlPoint(value);
                 if (responseNeeded) {
                     // Response: op code 0x80 (Response Code), request op code, result 0x01 (Success)
@@ -306,6 +390,10 @@ public class FtmsBridgeService extends Service {
                     gattServer.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, 0, response);
                 }
             } else if (UUID_FFF2.equals(characteristic.getUuid())) {
+                // Beeps are emitted by the start/stop handlers only (see handleSysControl) — not
+                // here. Beeping on every SYS_CONTROL beeped on FitShow's periodic speed/target
+                // tweaks during a run ("occasional beep"); beeping on every write beeped on the
+                // ~2x/s status polls (continuous beep). Neither is wanted.
                 // FitShow private-protocol downlink. We don't yet know the full command
                 // set, so log every frame (capture with: adb logcat -s FtmsBridge:D) so it
                 // can be decoded next iteration. Still ack so the write doesn't error out.
@@ -347,12 +435,12 @@ public class FtmsBridgeService extends Service {
         super.onDestroy();
         notifyHandler.removeCallbacks(notifyRunnable);
         unregisterObserver();
+        unregisterHeartbeatObserver();
         unbindService(treadmillConnection);
         stopAdvertising();
         stopFactoryScan();
         if (factoryGatt != null) { try { factoryGatt.close(); } catch (Exception ignored) {} factoryGatt = null; }
         if (gattServer != null) gattServer.close();
-        if (toneGen != null) { toneGen.release(); toneGen = null; }
         Log.d(TAG, "FTMS Bridge stopped");
     }
 
@@ -362,26 +450,63 @@ public class FtmsBridgeService extends Service {
     }
 
     // =========================================================
-    // Audible beep on received FTMS commands (throttled)
+    // Audible beep on received control commands (throttled)
     // =========================================================
-    private android.media.ToneGenerator toneGen;
+    // A ToneGenerator on STREAM_MUSIC *rendered* fine here (logcat showed AudioTrack delivering
+    // frames on every command) but was silent: this ROM reports every stream routed to
+    // `remote_submix` — the screen-share virtual sink, kept registered by the 无线传屏 services —
+    // so anything following default media routing never reaches the speaker. We therefore
+    // synthesise the tone and pin the AudioTrack to the built-in speaker.
     private volatile long lastBeepMs = 0;
     // Min gap between beeps: FitShow streams many Set-Speed/Incline writes per second during
     // a ramp; without throttling this would be a continuous tone. Tweak to taste.
     private static final long BEEP_MIN_INTERVAL_MS = 250;
     private static final int BEEP_DURATION_MS = 70;
+    private static final int BEEP_SAMPLE_RATE = 44100;
+    // 425 Hz ≈ what ToneGenerator's TONE_PROP_BEEP used to sound like (a low "嘟" rather than a
+    // thin high "滴"). Raise this if you want a sharper tone.
+    private static final double BEEP_FREQ_HZ = 425.0;
 
     private void beep() {
         long now = System.currentTimeMillis();
         if (now - lastBeepMs < BEEP_MIN_INTERVAL_MS) return;
         lastBeepMs = now;
         try {
-            if (toneGen == null) {
-                // STREAM_MUSIC = the treadmill's speakers; 80 = volume (0-100).
-                toneGen = new android.media.ToneGenerator(
-                        android.media.AudioManager.STREAM_MUSIC, 80);
+            int n = BEEP_SAMPLE_RATE * BEEP_DURATION_MS / 1000;
+            short[] pcm = new short[n];
+            int fade = BEEP_SAMPLE_RATE / 200; // 5 ms in/out ramp so it doesn't click
+            for (int i = 0; i < n; i++) {
+                double env = Math.min(1.0, Math.min(i, n - i) / (double) fade);
+                pcm[i] = (short) (Math.sin(2 * Math.PI * BEEP_FREQ_HZ * i / BEEP_SAMPLE_RATE)
+                        * 26000 * env);
             }
-            toneGen.startTone(android.media.ToneGenerator.TONE_PROP_BEEP, BEEP_DURATION_MS);
+            final android.media.AudioTrack track = new android.media.AudioTrack.Builder()
+                    .setAudioAttributes(new android.media.AudioAttributes.Builder()
+                            .setUsage(android.media.AudioAttributes.USAGE_ASSISTANCE_SONIFICATION)
+                            .setContentType(android.media.AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                            .build())
+                    .setAudioFormat(new android.media.AudioFormat.Builder()
+                            .setEncoding(android.media.AudioFormat.ENCODING_PCM_16BIT)
+                            .setSampleRate(BEEP_SAMPLE_RATE)
+                            .setChannelMask(android.media.AudioFormat.CHANNEL_OUT_MONO)
+                            .build())
+                    .setBufferSizeInBytes(pcm.length * 2)
+                    .setTransferMode(android.media.AudioTrack.MODE_STATIC)
+                    .build();
+            android.media.AudioManager am =
+                    (android.media.AudioManager) getSystemService(AUDIO_SERVICE);
+            for (android.media.AudioDeviceInfo d
+                    : am.getDevices(android.media.AudioManager.GET_DEVICES_OUTPUTS)) {
+                if (d.getType() == android.media.AudioDeviceInfo.TYPE_BUILTIN_SPEAKER) {
+                    track.setPreferredDevice(d);
+                    break;
+                }
+            }
+            track.write(pcm, 0, pcm.length);
+            track.play();
+            notifyHandler.postDelayed(() -> {
+                try { track.stop(); track.release(); } catch (Exception ignore) {}
+            }, BEEP_DURATION_MS + 150L);
         } catch (Exception e) {
             Log.w(TAG, "beep failed", e);
         }
@@ -550,17 +675,36 @@ public class FtmsBridgeService extends Service {
         }
     }
 
+    /** Subscribe to the treadmill's own heart-rate source (handgrip / chest strap). */
+    private void registerHeartbeatObserver() {
+        if (treadmillServiceBinder == null) return;
+        try {
+            Parcel data = Parcel.obtain();
+            data.writeInterfaceToken(ITREADMILL_DESCRIPTOR);
+            data.writeStrongBinder(heartbeatObserverBinder);
+            treadmillServiceBinder.transact(TXN_ADD_HR_OBSERVER, data, null, IBinder.FLAG_ONEWAY);
+            data.recycle();
+            Log.d(TAG, "Heartbeat observer registered");
+        } catch (RemoteException e) {
+            Log.e(TAG, "registerHeartbeatObserver failed", e);
+        }
+    }
+
+    private void unregisterHeartbeatObserver() {
+        if (treadmillServiceBinder == null) return;
+        try {
+            Parcel data = Parcel.obtain();
+            data.writeInterfaceToken(ITREADMILL_DESCRIPTOR);
+            data.writeStrongBinder(heartbeatObserverBinder);
+            treadmillServiceBinder.transact(TXN_REMOVE_HR_OBSERVER, data, null, IBinder.FLAG_ONEWAY);
+            data.recycle();
+        } catch (RemoteException e) {
+            Log.e(TAG, "unregisterHeartbeatObserver failed", e);
+        }
+    }
+
     // =========================================================
     // Handle FTMS Control Point commands from FitShow
-    // =========================================================
-    // ITreadmillService transaction codes for start/stop/pause
-    // Deduced from Stub onTransact switch order in b.java:
-    //   case 22 → l() → start
-    //   case 23 → m() → stop
-    //   case 24 → c(int) → pause (param: 1=stop, 2=pause)
-    private static final int TXN_START = 22;
-    private static final int TXN_STOP  = 23;
-    private static final int TXN_PAUSE = 24;
 
     private void handleControlPoint(byte[] value) {
         if (value == null || value.length == 0) return;
@@ -619,39 +763,12 @@ public class FtmsBridgeService extends Service {
     //   "resume_to_run" → k.A()  → restores saved speed, resumes running
     private static final String TRUNNING_ACTION = "com.seewo.trunning.to_thardwareservice";
 
-    // ITreadmillService additional transaction codes (verified from b.java Stub + f.java Running state):
-    //   transact(22) → k.l() → Halted.l() → transitions to Running state (f.java)
-    //   transact(23) → k.m() → Running.m() → transitions to Halting → Halted
-    private static final int TXN_START_WORKOUT = 22;
-    private static final int TXN_STOP_WORKOUT  = 23;
-
-    // Real software start. Confirmed by decompiling the hardware service + trunning panel app:
-    //   transact(1) → ITreadmillService.a() → TreadmillControllerImpl.l(): resets the workout
-    //   counters, sets the running flag, and transitions the state machine Halted → Running.
-    //   This is the SAME start primitive the panel's "快速启动 / Quick Start" ultimately uses.
-    //   (transact(22) we used before was controller.a() = SLOPE CALIBRATION — wrong.)
-    // ⚠️ This starts the belt remotely, bypassing the physical Start button. Make sure nobody
-    //    is standing on the belt unexpectedly when FitShow sends Start.
-    private static final int TXN_REAL_START = 1;
-
-    private void treadmillStart() {
-        if (treadmillServiceBinder == null) return;
-        try {
-            Parcel data = Parcel.obtain();
-            Parcel reply = Parcel.obtain();
-            data.writeInterfaceToken(ITREADMILL_DESCRIPTOR);
-            treadmillServiceBinder.transact(TXN_REAL_START, data, reply, 0);
-            reply.readException();
-            int result = reply.readInt();
-            data.recycle(); reply.recycle();
-            tmState = TmState.RUNNING;
-            treadmillRunning = true;
-            resetWorkout();
-            Log.d(TAG, "treadmillStart → transact(1) real start (Quick-Start path), result=" + result);
-        } catch (RemoteException e) {
-            Log.e(TAG, "treadmillStart transact(1) failed", e);
-        }
-    }
+    // ITreadmillService stop transaction (verified from b.java Stub + f.java Running state):
+    //   transact(23) → k.m() → Running.m() → transitions to Halting → Halted.
+    // Only used as a fallback when the factory-module stop relay isn't ready; the normal stop
+    // path is relayStopToFactory(). (Start is never done over this AIDL — the belt is started by
+    // relaying to the factory F63MAX-1218 module, which runs the native Quick-Start flow.)
+    private static final int TXN_STOP_WORKOUT = 23;
 
     /** Retries setSpeed(speed) every 500 ms until the AIDL returns 0 (not -6). */
     private void retrySetSpeed(double speed, int remaining) {
@@ -689,8 +806,6 @@ public class FtmsBridgeService extends Service {
     }
 
     private void treadmillStop() {
-        // Cancel any pending delayed start (e.g. user/app stopped during the countdown).
-        notifyHandler.removeCallbacks(delayedStartRunnable);
         // k.m() transitions: Running.m() → h state → Halting → Halted
         Log.d(TAG, "treadmillStop → transact(23)");
         if (treadmillServiceBinder == null) return;
@@ -704,6 +819,7 @@ public class FtmsBridgeService extends Service {
             tmState = TmState.STOPPED;
             treadmillRunning = false;
             currentSpeedKmh = 0;
+            startingUntilMs = 0; // cancel any pending start countdown
             Log.d(TAG, "treadmillStop OK");
         } catch (RemoteException e) { Log.e(TAG, "stop failed", e); }
     }
@@ -942,13 +1058,40 @@ public class FtmsBridgeService extends Service {
         disService.addCharacteristic(makeReadString(UUID_HARDWARE_REVISION, "1.0.1"));
         disService.addCharacteristic(makeReadString(UUID_SOFTWARE_REVISION, "1.7.1"));
 
-        // Register the three services sequentially (see pendingServices comment).
-        pendingServices.add(fmsService);
+        // ----- Heart Rate Service (0x180D) -----
+        // The treadmill's handgrip / strap reading is available to us via IHeartbeatObserver but
+        // there was no channel an app would read it from. Exposing the standard HRS lets FitShow
+        // (or Zwift, etc.) use the treadmill itself as a heart-rate source after connecting.
+        // NOTE: 0x180D is deliberately NOT added to the advertising packet — that packet is
+        // already ~30 of the 31 allowed bytes and must keep matching the TR1200 layout.
+        BluetoothGattService hrService = new BluetoothGattService(
+                UUID_HEART_RATE_SERVICE, BluetoothGattService.SERVICE_TYPE_PRIMARY);
+        hrMeasurementChar = new BluetoothGattCharacteristic(
+                UUID_HEART_RATE_MEASUREMENT,
+                BluetoothGattCharacteristic.PROPERTY_NOTIFY,
+                0);
+        hrMeasurementChar.addDescriptor(new BluetoothGattDescriptor(
+                UUID_CCCD,
+                BluetoothGattDescriptor.PERMISSION_READ | BluetoothGattDescriptor.PERMISSION_WRITE));
+        hrService.addCharacteristic(hrMeasurementChar);
+        // Body Sensor Location = 1 (Chest) — some clients read this before subscribing.
+        BluetoothGattCharacteristic bodySensor = new BluetoothGattCharacteristic(
+                UUID_BODY_SENSOR_LOCATION,
+                BluetoothGattCharacteristic.PROPERTY_READ,
+                BluetoothGattCharacteristic.PERMISSION_READ);
+        bodySensor.setValue(new byte[]{0x01});
+        hrService.addCharacteristic(bodySensor);
+
+        // Register the services sequentially (see pendingServices comment).
+        // In private-only mode the FTMS service is withheld so FitShow can't discover 0x1826.
+        if (!FITSHOW_PRIVATE_ONLY) pendingServices.add(fmsService);
         pendingServices.add(fff0Service);
         pendingServices.add(disService);
+        pendingServices.add(hrService);
         addNextService();
 
-        Log.d(TAG, "GATT services queued: FTMS (+ranges) + FFF0 (FFF1/FFF2) + DIS");
+        Log.d(TAG, "GATT services queued: " + (FITSHOW_PRIVATE_ONLY ? "[FTMS hidden] " : "FTMS (+ranges) ")
+                + "FFF0 (FFF1/FFF2) + DIS + HRS");
     }
 
     /** Adds the next queued GATT service; onServiceAdded triggers the following one. */
@@ -1019,21 +1162,28 @@ public class FtmsBridgeService extends Service {
         //   05 03 F0 FF 26 18                 Complete 16-bit UUIDs: 0xFFF0 + 0x1826
         //   06 16 26 18 01 00 01              FTMS Service Data (treadmill type + flags)
         // Total ≈ 30 bytes (within 31-byte limit)
-        AdvertiseData advData = new AdvertiseData.Builder()
+        AdvertiseData.Builder advBuilder = new AdvertiseData.Builder()
                 .setIncludeDeviceName(false)
                 .setIncludeTxPowerLevel(false)
                 // REQUIRED for iOS FitShow — without this manufacturer data (Company ID 0x0419)
                 // the iOS app shows an empty list. Android FitShow lists fine without it.
                 .addManufacturerData(FITSHOW_COMPANY_ID, mfData)
-                .addServiceUuid(fff0Uuid)
-                .addServiceUuid(ftmsUuid)
-                .addServiceData(ftmsUuid, new byte[]{0x01, 0x00, 0x01})
-                .build();
+                .addServiceUuid(fff0Uuid);
+        if (!FITSHOW_PRIVATE_ONLY) {
+            advBuilder.addServiceUuid(ftmsUuid)
+                      .addServiceData(ftmsUuid, new byte[]{0x01, 0x00, 0x01});
+        }
+        AdvertiseData advData = advBuilder.build();
 
-        // Scan response: device name starting with "TR" (required by FitShow name filter)
+        // Scan response: device name starting with "TR" (required by FitShow name filter).
+        // 0x180D goes here rather than in the primary packet: apps look for the Heart Rate
+        // Service UUID in the advertisement when listing HR devices, but the primary packet is
+        // already ~30 of 31 bytes and must keep matching the TR1200 layout byte-for-byte.
+        // The scan response is a second 31-byte packet and scanners merge the two.
         AdvertiseData scanResponse = new AdvertiseData.Builder()
                 .setIncludeDeviceName(true)
                 .setIncludeTxPowerLevel(false)
+                .addServiceUuid(new android.os.ParcelUuid(UUID_HEART_RATE_SERVICE))
                 .build();
 
         advertiser.startAdvertising(settings, advData, scanResponse, advertiseCallback);
@@ -1079,10 +1229,15 @@ public class FtmsBridgeService extends Service {
         // FTMS Treadmill Data flags (uint16):
         //   bit 0 (More Data) = 0  → Instantaneous Speed present
         //   bit 3            = 1  → Inclination + Ramp Angle Setting present (4 bytes total)
-        // Field order follows bit order: [flags][inst speed][inclination][ramp angle].
-        int flags = 0x0008; // always report inclination so FitShow can display it
+        //   bit 8            = 1  → Heart Rate present (uint8), only when we actually have one
+        // Field order follows bit order: [flags][inst speed][inclination][ramp angle][heart rate].
+        // We advertise Heart Rate Measurement Supported in FMS_FEATURE (bit 10), so standard
+        // FTMS clients (Zwift etc.) expect this field once a reading exists.
+        int hr = currentHeartRate();
+        int flags = 0x0008;                 // always report inclination so FitShow can display it
+        if (hr > 0) flags |= 0x0100;        // bit 8 — heart rate present
 
-        byte[] payload = new byte[8];
+        byte[] payload = new byte[hr > 0 ? 9 : 8];
         payload[0] = (byte) (flags & 0xFF);
         payload[1] = (byte) ((flags >> 8) & 0xFF);
         payload[2] = (byte) (speedRaw & 0xFF);            // Instantaneous Speed (uint16, 0.01 km/h)
@@ -1091,9 +1246,11 @@ public class FtmsBridgeService extends Service {
         payload[5] = (byte) ((inclineRaw >> 8) & 0xFF);
         payload[6] = 0;                                   // Ramp Angle Setting (sint16, 0.1 deg)
         payload[7] = 0;
+        if (hr > 0) payload[8] = (byte) (hr & 0xFF);      // Heart Rate (uint8, bpm)
 
         treadmillDataChar.setValue(payload);
         gattServer.notifyCharacteristicChanged(connectedDevice, treadmillDataChar, false);
+        if (hr > 0) Log.d(TAG, "TreadmillData TX (hr=" + hr + "): " + bytesToHex(payload));
     }
 
     private void notifyMachineStatus(byte statusCode) {
@@ -1128,7 +1285,7 @@ public class FtmsBridgeService extends Service {
 
         switch (cmd) {
             case CMD_SYS_INFO:    respondSysInfo(dataBytes);   break;
-            case CMD_SYS_STATUS:  respondSysStatus();          break;
+            case CMD_SYS_STATUS:  respondSysStatus(dataBytes); break;
             case CMD_SYS_CONTROL: handleSysControl(dataBytes); break;
             case CMD_SYS_DATA:    respondSysData(dataBytes);   break;
             default:
@@ -1171,16 +1328,34 @@ public class FtmsBridgeService extends Service {
     }
 
     // SYS_STATUS (0x51): reply with current run state + telemetry (polled ~3x/s by the app).
-    private void respondSysStatus() {
+    // The *request* carries the app's heart rate: SYS_STATUS | 心率(B) | 备用(N) — this is how
+    // FitShow forwards the HR from the source the user picked (e.g. an Apple Watch). We latch it
+    // and hand it straight back in 当前心率, which is the value the app then displays.
+    private void respondSysStatus(byte[] req) {
+        if (req != null && req.length > 0) {
+            int hr = req[0] & 0xFF;
+            if (hr > 0 && hr < 250) {
+                appHeartRate = hr;
+                appHeartRateMs = System.currentTimeMillis();
+                Log.d(TAG, "App HR (SYS_STATUS): " + hr);
+                notifyHeartRate();
+            }
+        }
         java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+        long now = System.currentTimeMillis();
+        boolean starting = tmState != TmState.RUNNING && now < startingUntilMs;
         int status;
         switch (tmState) {
             case RUNNING: status = ST_RUNNING; break;
             case PAUSED:  status = ST_PAUSED;  break;
-            default:      status = ST_NORMAL;  break;
+            default:      status = starting ? ST_START : ST_NORMAL; break;
         }
         out.write(status);
-        if (status == ST_RUNNING) {
+        if (status == ST_START) {
+            // STATUS_START (2): remaining native-countdown seconds — tells FitShow "starting, wait".
+            int remain = (int) Math.ceil((startingUntilMs - now) / 1000.0);
+            out.write(Math.max(0, Math.min(9, remain)));        // 当前倒计启动秒值 (B)
+        } else if (status == ST_RUNNING) {
             int spd = (int) Math.round(currentSpeedKmh * 10);   // 0.1 km/h units
             out.write(Math.max(0, Math.min(255, spd)));         // 当前速度 (B)
             out.write(currentSlope & 0xFF);                     // 当前坡度 (B)
@@ -1188,10 +1363,30 @@ public class FtmsBridgeService extends Service {
             writeW(out, workoutDistanceM);                      // 正计距离 (W) m
             writeW(out, (int) workoutKcal);                     // 正计热量 (W)
             writeW(out, workoutSteps);                          // 正计步数 (W)
-            out.write(0);                                       // 当前心率 (B)
+            out.write(currentHeartRate() & 0xFF);               // 当前心率 (B)
             out.write(0);                                       // 当前程式段数 (B)
         }
         notifyFff1(buildFrame(CMD_SYS_STATUS, out.toByteArray()));
+    }
+
+    /**
+     * Begin a run for the private (FFF0) protocol. Shared by all three start triggers FitShow may
+     * use: CONTROL_READY(compat mode), CONTROL_START(9), and the observed 0x9F. Relays the native
+     * start to the factory F63MAX-1218 module and opens the STARTING window so SYS_STATUS reports a
+     * countdown until the belt is moving. Idempotent — ignored if already running / mid-countdown,
+     * so FitShow's periodic re-sends don't re-trigger start or beep.
+     */
+    private void doPrivateStart() {
+        if (tmState == TmState.RUNNING || System.currentTimeMillis() < startingUntilMs) return;
+        beep();
+        if (tmState == TmState.PAUSED) {
+            treadmillResume();
+        } else {
+            resetWorkout();
+            startingUntilMs = System.currentTimeMillis() + START_COUNTDOWN_MS;
+            boolean ok = relayStartToFactory();
+            Log.d(TAG, "private START → relay factory=" + ok);
+        }
     }
 
     // SYS_CONTROL (0x53): drive the treadmill, then echo per spec.
@@ -1199,13 +1394,24 @@ public class FtmsBridgeService extends Service {
         if (data.length < 1) { notifyFff1(buildFrame(CMD_SYS_CONTROL, new byte[0])); return; }
         int sub = data[0] & 0xFF;
         switch (sub) {
-            case CTL_READY:
-                resetWorkout();
+            case CTL_READY: {
+                // CONTROL_READY payload: [sub][运动ID:4][模式:1][程序段数:1][模式倒计数:2].
+                // Spec: when the mode byte's high bit (0x80) is NOT set, the device runs in
+                // "compatibility mode" and must START on READY itself (FitShow then never sends a
+                // separate CONTROL_START). Observed live: FitShow sends READY with 模式=0x00.
+                int mode = data.length > 5 ? (data[5] & 0xFF) : 0;
+                if ((mode & 0x80) == 0) {
+                    Log.d(TAG, "CONTROL_READY mode=0x" + Integer.toHexString(mode) + " (compat) → START");
+                    doPrivateStart();
+                } else {
+                    resetWorkout();
+                    Log.d(TAG, "CONTROL_READY mode=0x" + Integer.toHexString(mode) + " → await START");
+                }
                 notifyFff1(buildFrame(CMD_SYS_CONTROL, new byte[]{(byte) CTL_READY, 0x00})); // 启动秒数=0
                 break;
+            }
             case CTL_START:
-                if (tmState == TmState.PAUSED) treadmillResume();
-                else { resetWorkout(); treadmillStart(); }
+                doPrivateStart();
                 notifyFff1(buildFrame(CMD_SYS_CONTROL, new byte[]{(byte) CTL_START}));
                 break;
             case CTL_PAUSE:
@@ -1213,10 +1419,19 @@ public class FtmsBridgeService extends Service {
                 notifyFff1(buildFrame(CMD_SYS_CONTROL, new byte[]{(byte) CTL_PAUSE}));
                 break;
             case CTL_STOP:
-                treadmillStop();
+                // Start was relayed to the factory F63MAX-1218 module, so Stop must go there too —
+                // the Seewo AIDL stop (transact 23) does not halt a factory-started belt (that
+                // mismatch was why App-side Stop did nothing). Fall back to AIDL if the factory
+                // link isn't ready.
+                beep();
+                startingUntilMs = 0;
+                if (!relayStopToFactory()) treadmillStop();
                 notifyFff1(buildFrame(CMD_SYS_CONTROL, new byte[]{(byte) CTL_STOP}));
                 break;
             case CTL_TARGET: {
+                // Speed/incline command from the app — audible feedback (throttled to
+                // BEEP_MIN_INTERVAL_MS so a fast ramp of many writes doesn't become one long tone).
+                beep();
                 int tSpeed   = data.length > 1 ? (data[1] & 0xFF) : -1; // 0.1 km/h
                 int tIncline = data.length > 2 ? (data[2] & 0xFF) : -1; // raw level
                 if (tSpeed >= 0)   setTreadmillSpeed(tSpeed / 10.0);
@@ -1227,6 +1442,14 @@ public class FtmsBridgeService extends Service {
                         (byte) (tIncline >= 0 ? tIncline : 0)})); // 实际目标坡度
                 break;
             }
+            case 0x9F:
+                // FitShow's private-protocol START (observed: 53 9F 02 00 7F). Not in the documented
+                // subcommand table, but it is the control FitShow sends when it wants the belt to
+                // start (STOP=0x03 is documented and matches). Relay the native start to the factory
+                // F63MAX-1218 module and open the STARTING window so SYS_STATUS reports a countdown.
+                doPrivateStart();
+                notifyFff1(buildFrame(CMD_SYS_CONTROL, data)); // echo the received payload
+                break;
             case CTL_USER:
             case CTL_SPEED:
             case CTL_INCLINE:
